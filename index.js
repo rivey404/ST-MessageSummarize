@@ -54,6 +54,8 @@ const css_remember_memory = `qvink_old_memory`
 const css_exclude_memory = `qvink_exclude_memory`
 const css_lagging_memory = `qvink_lagging_memory`
 const css_removed_message = `qvink_removed_message`
+const css_group_leader = `qvink_group_leader`
+const css_group_member = `qvink_group_member`
 const summary_div_class = `qvink_memory_text`  // class put on all added summary divs to identify them
 const summary_reasoning_class = 'qvink_memory_reasoning'
 const css_button_separator = `qvink_memory_button_separator`
@@ -122,10 +124,10 @@ const default_settings = {
     summarization_delay: 0,  // delay auto-summarization by this many messages (0 summarizes immediately after sending, 1 waits for one message, etc)
     summarization_time_delay: 0, // time in seconds to delay between summarizations
     summarization_time_delay_skip_first: false,  // skip the first delay after a character message
-    auto_summarize_batch_size: 1,  // number of messages to summarize at once when auto-summarizing
-    group_mode: false, // whether to summarize messages in groups
-    group_size: 2, // number of assistant messages to summarize in a group
-    include_user_messages_in_group: false, // whether to include user messages in group summarization
+    group_mode: false,  // whether to use group mode for summarization
+    group_size: 4,  // number of messages per group when group mode is enabled
+    include_user_with_assistant: false,  // whether to include user messages with assistant messages (both group and non-group mode)
+    auto_summarize_batch_size: 1,  // number of messages (or groups if group mode) to summarize at once when auto-summarizing
     auto_summarize_message_limit: 10,  // maximum number of messages to go back for auto-summarization.
     auto_summarize_on_edit: false,  // whether to automatically re-summarize edited chat messages
     auto_summarize_on_swipe: true,  // whether to automatically summarize new message swipes
@@ -585,6 +587,23 @@ function hard_reset_settings() {
     });
 }
 function soft_reset_settings() {
+    // Migrate old setting names for backward compatibility
+    if (extension_settings[MODULE_NAME]?.group_include_user_messages !== undefined) {
+        extension_settings[MODULE_NAME].include_user_with_assistant = extension_settings[MODULE_NAME].group_include_user_messages;
+        delete extension_settings[MODULE_NAME].group_include_user_messages;
+        log("Migrated setting: group_include_user_messages -> include_user_with_assistant");
+    }
+    
+    // Also migrate in all profiles
+    let profiles = extension_settings[MODULE_NAME]?.profiles || {};
+    for (let [profile_name, profile_settings] of Object.entries(profiles)) {
+        if (profile_settings.group_include_user_messages !== undefined) {
+            profile_settings.include_user_with_assistant = profile_settings.group_include_user_messages;
+            delete profile_settings.group_include_user_messages;
+            log(`Migrated setting in profile "${profile_name}": group_include_user_messages -> include_user_with_assistant`);
+        }
+    }
+
     // fix any missing settings without destroying profiles
     extension_settings[MODULE_NAME] = Object.assign(
         structuredClone(default_settings),
@@ -593,7 +612,7 @@ function soft_reset_settings() {
     );
 
     // check for any missing profiles
-    let profiles = get_settings('profiles');
+    profiles = get_settings('profiles');
     if (Object.keys(profiles).length === 0) {
         log("No profiles found, creating default profile.")
         profiles['Default'] = structuredClone(default_settings);
@@ -1015,10 +1034,22 @@ function refresh_settings() {
         get_settings_element('auto_summarize_progress')?.prop('disabled', !auto_summarize);
         get_settings_element('summarization_delay')?.prop('disabled', !auto_summarize);
         
-        // when group mode is disabled, group-related settings get disabled
+        // Group mode settings - enable/disable based on auto_summarize and group_mode
+        get_settings_element('group_mode')?.prop('disabled', !auto_summarize);
+        
         let group_mode = get_settings('group_mode');
-        get_settings_element('group_size')?.prop('disabled', !group_mode);
-        get_settings_element('include_user_messages_in_group')?.prop('disabled', !group_mode);
+        get_settings_element('group_size')?.prop('disabled', !auto_summarize || !group_mode);
+        // include_user_with_assistant works in both group and non-group mode, so only disable if auto_summarize is off
+        get_settings_element('include_user_with_assistant')?.prop('disabled', !auto_summarize);
+        
+        // Update batch size tooltip based on group mode
+        let batch_size_element = get_settings_element('auto_summarize_batch_size');
+        if (batch_size_element) {
+            let new_title = group_mode ? 
+                "Wait until this many groups are ready before auto-summarizing them all in sequence (1 = summarize every group immediately, 2 = summarize when you have two groups ready, etc)." :
+                "Wait until this many messages before auto-summarizing them all in sequence (1 = summarize every message immediately, 2 = summarize when you have two ready, etc). Still summarizes one at a time.";
+            batch_size_element.parent().attr('title', new_title);
+        }
 
         // If not excluding message, then disable the option to preserve the last user message
         let excluding_messages = get_settings('exclude_messages_after_threshold')
@@ -1383,6 +1414,8 @@ function get_summary_style_class(message) {
     let remember = get_data(message, 'remember');
     let exclude = get_data(message, 'exclude');  // force-excluded by user
     let lagging = get_data(message, 'lagging');  // not injected yet
+    let group_leader = get_data(message, 'group_leader');
+    let group_member = get_data(message, 'group_member');
 
     let style = ""
     if (remember && include) {  // marked to be remembered and included in memory anywhere
@@ -1397,6 +1430,13 @@ function get_summary_style_class(message) {
 
     if (lagging) {
         style = `${style} ${css_lagging_memory}`
+    }
+
+    // Add group styling
+    if (group_leader) {
+        style = `${style} ${css_group_leader}`
+    } else if (group_member) {
+        style = `${style} ${css_group_member}`
     }
 
     return style
@@ -1447,6 +1487,16 @@ function update_message_visuals(i, style=true, text=null) {
         text = ""  // default text when no memory
         if (memory) {
             text = clean_string_for_html(`Memory: ${memory}`)
+        } else if (get_data(message, 'group_member')) {
+            // Group member - show reference to group leader
+            let leader_index = get_data(message, 'group_leader_index');
+            let context = getContext();
+            let leader_memory = get_memory(context.chat[leader_index]);
+            if (leader_memory) {
+                text = clean_string_for_html(`Group Member (summary at message ${leader_index + 1}): ${leader_memory}`)
+            } else {
+                text = clean_string_for_html(`Group Member (leader: message ${leader_index + 1})`)
+            }
         } else if (error_message) {
             style_class = ''  // clear the style class if there's an error
             text = `Error: ${error_message}`
@@ -3163,6 +3213,26 @@ function edit_memory(message, text) {
 
     let current_text = get_memory(message)
     if (text === current_text) return;  // no change
+    
+    // If this is a group member, break the group relationship
+    if (get_data(message, 'group_member')) {
+        set_data(message, 'group_member', null);
+        set_data(message, 'group_leader_index', null);
+    }
+    
+    // If this is a group leader, break relationships with members
+    if (get_data(message, 'group_leader')) {
+        let members = get_data(message, 'group_members') || [];
+        let context = getContext();
+        for (let member_index of members) {
+            let member_message = context.chat[member_index];
+            set_data(member_message, 'group_member', null);
+            set_data(member_message, 'group_leader_index', null);
+        }
+        set_data(message, 'group_leader', null);
+        set_data(message, 'group_members', null);
+    }
+    
     set_data(message, "memory", text);
     set_data(message, "error", null)  // remove any errors
     set_data(message, "reasoning", null)  // remove any reasoning
@@ -3177,6 +3247,26 @@ function edit_memory(message, text) {
 }
 function clear_memory(message) {
     // clear the memory from a message
+    
+    // If this is a group member, break the group relationship
+    if (get_data(message, 'group_member')) {
+        set_data(message, 'group_member', null);
+        set_data(message, 'group_leader_index', null);
+    }
+    
+    // If this is a group leader, break relationships with members
+    if (get_data(message, 'group_leader')) {
+        let members = get_data(message, 'group_members') || [];
+        let context = getContext();
+        for (let member_index of members) {
+            let member_message = context.chat[member_index];
+            set_data(member_message, 'group_member', null);
+            set_data(member_message, 'group_leader_index', null);
+        }
+        set_data(message, 'group_leader', null);
+        set_data(message, 'group_members', null);
+    }
+    
     set_data(message, "memory", null);
     set_data(message, "error", null)  // remove any errors
     set_data(message, "reasoning", null)  // remove any reasoning
@@ -3339,6 +3429,71 @@ function check_message_exclusion(message) {
         return false;
     }
 
+    return true;
+}
+
+function check_message_exclusion_except_user_setting(message) {
+    // Same as check_message_exclusion but skips the include_user_messages check
+    // Used when we want to include user messages with assistant messages regardless of the include_user_messages setting
+    if (!message) {
+        debug(`Message excluded: no message object`);
+        return false;
+    }
+
+    // system messages sent by this extension are always ignored
+    if (get_data(message, 'is_qvink_system_memory')) {
+        debug(`Message excluded: is_qvink_system_memory`);
+        return false;
+    }
+
+    // first check if it has been marked to be remembered by the user - if so, it bypasses all other exclusion criteria
+    if (get_data(message, 'remember')) {
+        debug(`Message included: marked to remember`);
+        return true;
+    }
+
+    // check if it's marked to be excluded - if so, exclude it
+    if (get_data(message, 'exclude')) {
+        debug(`Message excluded: marked to exclude`);
+        return false;
+    }
+
+    // SKIP the include_user_messages check for user messages
+
+    // check if it's a thought message and exclude (Stepped Thinking extension)
+    // TODO: This is deprecated in the thought extension, could be removed at some point?
+    if (message.is_thoughts) {
+        debug(`Message excluded: is_thoughts`);
+        return false;
+    }
+
+    // check if it's a hidden message and exclude if the setting is disabled
+    if (!get_settings('include_system_messages') && message.is_system) {
+        debug(`Message excluded: is_system and include_system_messages=false`);
+        return false;
+    }
+
+    // check if it's a narrator message
+    if (!get_settings('include_narrator_messages') && message.extra.type === system_message_types.NARRATOR) {
+        debug(`Message excluded: is narrator and include_narrator_messages=false`);
+        return false;
+    }
+
+    // check if the character is disabled
+    let char_key = get_character_key(message);
+    if (!character_enabled(char_key)) {
+        debug(`Message excluded: character disabled (${char_key})`);
+        return false;
+    }
+
+    // Check if the message is too short
+    let token_size = count_tokens(message.mes);
+    if (token_size < get_settings('message_length_threshold')) {
+        debug(`Message excluded: too short (${token_size} < ${get_settings('message_length_threshold')})`);
+        return false;
+    }
+
+    debug(`Message included: passed all checks except user setting`);
     return true;
 }
 function update_message_inclusion_flags() {
@@ -3533,6 +3688,7 @@ async function summarize_messages(indexes=null, show_progress=true, skip_initial
     if (!indexes.length) return;
 
     debug(`Summarizing ${indexes.length} messages`)
+    console.log(`[${MODULE_NAME_FANCY}] SUMMARIZE_MESSAGES CALLED WITH:`, JSON.stringify(indexes));
 
      // only show progress if there's more than one message to summarize
     show_progress = show_progress && indexes.length > 1;
@@ -3557,9 +3713,113 @@ async function summarize_messages(indexes=null, show_progress=true, skip_initial
     await set_connection_profile(summary_profile);
     await set_preset(summary_preset);
 
+    if (get_settings('group_mode')) {
+        // In group mode, organize indexes into groups and summarize each group together
+        await summarize_messages_in_groups(indexes, show_progress, skip_initial_delay);
+    } else {
+        // Non-group mode - handle both individual messages and mini-groups
+        let n = 0;
+        for (let item of indexes) {
+            if (show_progress) progress_bar('summarize', n+1, indexes.length, "Summarizing");
+
+            // check if summarization was stopped by the user
+            if (STOP_SUMMARIZATION) {
+                log('Summarization stopped');
+                break;
+            }
+
+            // Wait for time delay if set (only delay first if initial delay set)
+            let time_delay = get_settings('summarization_time_delay')
+            if (time_delay > 0 && (n > 0 || (n === 0 && !skip_initial_delay))) {
+                debug(`Delaying generation by ${time_delay} seconds`)
+                if (show_progress) progress_bar('summarize', null, null, "Delaying")
+                await new Promise((resolve) => {
+                    SUMMARIZATION_DELAY_TIMEOUT = setTimeout(resolve, time_delay * 1000)
+                    SUMMARIZATION_DELAY_RESOLVE = resolve  // store the resolve function to call when cleared
+                });
+
+                // check if summarization was stopped by the user during the delay
+                if (STOP_SUMMARIZATION) {
+                    log('Summarization stopped');
+                    break;
+                }
+            }
+
+            // Check if item is a mini-group (array) or single message (integer)
+            if (Array.isArray(item)) {
+                // Mini-group: summarize multiple messages together
+                await summarize_message_group(item);
+            } else {
+                // Single message: summarize individually
+                await summarize_message(item);
+            }
+            n += 1;
+        }
+    }
+
+    // restore the completion preset and connection profile
+    await set_connection_profile(current_profile);
+    await set_preset(current_preset);
+
+    // remove the progress bar
+    if (show_progress) remove_progress_bar('summarize')
+
+    if (STOP_SUMMARIZATION) {  // check if summarization was stopped
+        STOP_SUMMARIZATION = false  // reset the flag
+    } else {
+        debug(`Messages summarized: ${indexes.length}`)
+    }
+
+    if (get_settings('block_chat')) {
+        ctx.activateSendButtons();
+    }
+
+    refresh_memory()
+
+    // Update the memory state interface if it's open
+    memoryEditInterface.update_table()
+}
+
+async function summarize_messages_in_groups(indexes, show_progress, skip_initial_delay) {
+    // Organize message indexes into groups based on group settings and summarize each group
+    let group_size = get_settings('group_size');
+    let include_user_in_groups = get_settings('include_user_with_assistant');
+    let context = getContext();
+    let groups = [];  // Array of groups, each group is an array of message indices
+    
+    // Organize messages into groups
+    let current_group = [];
+    let assistant_count = 0;
+    
+    for (let index of indexes) {
+        let message = context.chat[index];
+        
+        if (message.is_user && include_user_in_groups) {
+            current_group.push(index);
+        } else if (!message.is_user) {
+            current_group.push(index);
+            assistant_count++;
+            
+            // Check if we've reached the group size (based on assistant messages)
+            if (assistant_count >= group_size) {
+                groups.push([...current_group]);
+                current_group = [];
+                assistant_count = 0;
+            }
+        }
+    }
+    
+    // Add any remaining messages as a final group
+    if (current_group.length > 0) {
+        groups.push(current_group);
+    }
+    
+    debug(`Organized ${indexes.length} messages into ${groups.length} groups`);
+    
+    // Summarize each group
     let n = 0;
-    for (let i of indexes) {
-        if (show_progress) progress_bar('summarize', n+1, indexes.length, "Summarizing");
+    for (let group of groups) {
+        if (show_progress) progress_bar('summarize', n+1, groups.length, "Summarizing Groups");
 
         // check if summarization was stopped by the user
         if (STOP_SUMMARIZATION) {
@@ -3584,32 +3844,173 @@ async function summarize_messages(indexes=null, show_progress=true, skip_initial
             }
         }
 
-        await summarize_message(i);
+        await summarize_message_group(group);
         n += 1;
     }
+}
 
-
-    // restore the completion preset and connection profile
-    await set_connection_profile(current_profile);
-    await set_preset(current_preset);
-
-    // remove the progress bar
-    if (show_progress) remove_progress_bar('summarize')
-
-    if (STOP_SUMMARIZATION) {  // check if summarization was stopped
-        STOP_SUMMARIZATION = false  // reset the flag
-    } else {
-        debug(`Messages summarized: ${indexes.length}`)
+async function summarize_message_group(group_indexes) {
+    // Summarize a group of messages together, creating a single summary that applies to all messages in the group
+    let context = getContext();
+    let group_messages = group_indexes.map(i => context.chat[i]);
+    
+    console.log(`[${MODULE_NAME_FANCY}] SUMMARIZE_MESSAGE_GROUP CALLED WITH:`, group_indexes);
+    debug(`Summarizing group: [${group_indexes.join(', ')}]`);
+    
+    // Mark all messages in the group as being summarized
+    for (let index of group_indexes) {
+        let message = context.chat[index];
+        set_data(message, 'reasoning', "");
+        update_message_visuals(index, false, "Summarizing group...");
+        memoryEditInterface.update_message_visuals(index, null, false, "Summarizing group...");
     }
-
-    if (get_settings('block_chat')) {
-        ctx.activateSendButtons();
+    
+    // Scroll to the last message in the group if it's the most recent
+    let last_index = Math.max(...group_indexes);
+    if (last_index === chat.length - 1) {
+        scrollChatToBottom();
     }
-
-    refresh_memory()
-
-    // Update the memory state interface if it's open
-    memoryEditInterface.update_table()
+    
+    // Create a temporary combined message for prompting
+    let combined_text = "";
+    for (let i = 0; i < group_indexes.length; i++) {
+        let index = group_indexes[i];
+        let message = context.chat[index];
+        let sender = message.is_user ? "User" : (message.name || "Assistant");
+        combined_text += `${sender}: ${message.mes}`;
+        if (i < group_indexes.length - 1) {
+            combined_text += "\n\n";
+        }
+    }
+    
+    debug(`Combined text for group [${group_indexes.join(', ')}]: "${combined_text}"`);
+    
+    // Create a temporary message object that mimics the structure expected by the prompt system
+    let temp_message = {
+        mes: combined_text,
+        is_user: false,
+        name: "Group",
+        extra: {}
+    };
+    
+    // Temporarily add this message to the chat to create a proper prompt
+    let temp_index = context.chat.length;
+    context.chat.push(temp_message);
+    
+    try {
+        // Create the summary prompt using the existing system
+        let prompt = await summaryPromptEditInterface.create_summary_prompt(temp_index);
+        
+        // Generate the summary
+        let summary;
+        let err = null;
+        try {
+            debug(`Generating summary for group: [${group_indexes.join(', ')}]`);
+            summary = await summarize_text(prompt);
+        } catch (e) {
+            if (e === "Clicked stop button") {
+                err = "Summarization aborted";
+            } else {
+                err = e.message;
+                if (e.message === "No message generated") {
+                    err = "Empty Response";
+                } else {
+                    error(`Unrecognized error when summarizing group [${group_indexes.join(', ')}]: ${e}`);
+                }
+            }
+            summary = null;
+        }
+        
+        if (summary) {
+            debug("Group summarized: " + summary);
+            
+            // Determine the group leader (most recent message)
+            let leader_index = Math.max(...group_indexes);
+            
+            // Apply the summary only to the group leader, mark others as group members
+            for (let index of group_indexes) {
+                let message = context.chat[index];
+                let message_hash = getStringHash(message.mes);
+                
+                if (index === leader_index) {
+                    // This is the group leader - gets the actual summary
+                    
+                    // Handle prefill and reasoning parsing
+                    let prefill = get_settings('prefill');
+                    let prefilled_summary = summary;
+                    if (prefill) {
+                        prefilled_summary = `${prefill}${summary}`;
+                    }
+                    
+                    let parsed_reasoning_object = context.parseReasoningFromString(prefilled_summary);
+                    let reasoning = "";
+                    if (parsed_reasoning_object?.reasoning) {
+                        debug("Reasoning parsed for group: ");
+                        debug(parsed_reasoning_object);
+                        reasoning = parsed_reasoning_object.reasoning;
+                        summary = parsed_reasoning_object.content;
+                    }
+                    
+                    // Store the summary data on the leader
+                    set_data(message, 'memory', summary);
+                    set_data(message, 'hash', message_hash);
+                    set_data(message, 'error', null);
+                    set_data(message, 'edited', false);
+                    set_data(message, 'group_leader', true);
+                    set_data(message, 'group_members', group_indexes.filter(i => i !== index));
+                    set_data(message, 'prefill', reasoning ? "" : get_settings('prefill'));
+                    set_data(message, 'reasoning', reasoning);
+                    
+                    debug(`Group summary applied to leader message ${index}: "${summary}"`);
+                } else {
+                    // This is a group member - just gets a reference to the leader
+                    set_data(message, 'memory', null);  // Ensure no duplicate summary
+                    set_data(message, 'hash', message_hash);
+                    set_data(message, 'error', null);
+                    set_data(message, 'edited', false);
+                    set_data(message, 'group_member', true);
+                    set_data(message, 'group_leader_index', leader_index);
+                    set_data(message, 'prefill', null);
+                    set_data(message, 'reasoning', null);
+                    
+                    debug(`Message ${index} marked as group member, leader: ${leader_index}`);
+                }
+                
+                // Update visuals
+                update_message_visuals(index, false);
+                memoryEditInterface.update_message_visuals(index, null, false);
+            }
+            
+            // Save the chat
+            saveChatDebounced();
+        } else {
+            // Handle error case
+            for (let index of group_indexes) {
+                let message = context.chat[index];
+                set_data(message, 'error', err || 'Failed to generate group summary');
+                set_data(message, 'memory', null);
+                set_data(message, 'edited', false);
+                set_data(message, 'prefill', null);
+                set_data(message, 'reasoning', null);
+                // Clear any group data
+                set_data(message, 'group_leader', null);
+                set_data(message, 'group_member', null);
+                set_data(message, 'group_members', null);
+                set_data(message, 'group_leader_index', null);
+                update_message_visuals(index, false);
+                memoryEditInterface.update_message_visuals(index, null, false);
+            }
+        }
+        
+    } finally {
+        // Remove the temporary message from the chat
+        context.chat.pop();
+        
+        // Scroll to the last message in the group if it's the most recent
+        if (last_index === chat.length - 1) {
+            scrollChatToBottom();
+        }
+    }
 }
 async function summarize_message(index) {
     // Summarize a message given the chat index, replacing any existing memories
@@ -3701,93 +4102,6 @@ async function summarize_message(index) {
         scrollChatToBottom()
     }
 }
-async function summarize_message_group(group_data) {
-    // Summarize a group of assistant messages (and optionally their user messages)
-    let context = getContext();
-    let { assistant_indexes, user_indexes, range_label } = group_data;
-    let last_assistant_index = assistant_indexes[assistant_indexes.length - 1];
-    let last_message = context.chat[last_assistant_index];
-    
-    let combined_text = "";
-    let all_indexes = [...assistant_indexes, ...user_indexes].sort((a, b) => a - b);
-
-    // Show "Summarizing in group..." on all affected messages
-    for (let index of all_indexes) {
-        set_data(context.chat[index], 'reasoning', "");
-        update_message_visuals(index, false, "Summarizing in group...");
-        memoryEditInterface.update_message_visuals(index, null, false, "Summarizing in group...");
-    }
-
-    // Build combined text from all messages in chronological order
-    for (let index of all_indexes) {
-        let message = context.chat[index];
-        combined_text += `${message.name}: ${message.mes}\n`;
-    }
-
-    // Create a temporary message object for summarization
-    let temp_message = { ...last_message, mes: combined_text };
-    let prompt = await summaryPromptEditInterface.create_summary_prompt(last_assistant_index);
-
-    // Override the message content in the prompt
-    for (let msg of prompt) {
-        if (msg.content && msg.content.includes(last_message.mes)) {
-            msg.content = msg.content.replace(last_message.mes, combined_text);
-        }
-    }
-
-    let summary;
-    let err = null;
-    try {
-        debug(`Summarizing message group ${range_label}...`);
-        summary = await summarize_text(prompt);
-    } catch (e) {
-        if (e === "Clicked stop button") {
-            err = "Summarization aborted";
-        } else {
-            err = e.message;
-            if (e.message === "No message generated") {
-                err = "Empty Response";
-            } else {
-                error(`Unrecognized error when summarizing message group ${range_label}: ${e}`);
-            }
-        }
-        summary = null;
-    }
-
-    if (summary) {
-        debug(`Message group ${range_label} summarized: ${summary}`);
-        // Store summary with range label
-        let labeled_summary = `[${range_label}] ${summary}`;
-        set_data(last_message, 'memory', labeled_summary);
-        set_data(last_message, 'hash', getStringHash(combined_text));
-        set_data(last_message, 'error', null);
-        set_data(last_message, 'edited', false);
-        set_data(last_message, 'prefill', get_settings('prefill'));
-        set_data(last_message, 'reasoning', "");
-    } else {
-        error(`Failed to summarize message group ${range_label}: ${err}`);
-        set_data(last_message, 'error', err || "Summarization failed");
-        set_data(last_message, 'memory', null);
-        set_data(last_message, 'edited', false);
-        set_data(last_message, 'prefill', null);
-        set_data(last_message, 'reasoning', null);
-    }
-
-    // Clear the "Summarizing in group..." message from all messages
-    for (let index of all_indexes) {
-        if (index !== last_assistant_index) {
-            update_message_visuals(index, false, "");
-            memoryEditInterface.update_message_visuals(index, null, false, "");
-        }
-    }
-
-    update_message_visuals(last_assistant_index, false);
-    memoryEditInterface.update_message_visuals(last_assistant_index, null, false);
-
-    if (last_assistant_index === context.chat.length - 1) {
-        scrollChatToBottom();
-    }
-}
 async function summarize_text(messages) {
     let ctx = getContext()
 
@@ -3857,160 +4171,287 @@ function stop_summarization() {
     log("Aborted summarization.")
 }
 function collect_messages_to_auto_summarize() {
+    // iterate through the chat in chronological order and check which messages need to be summarized.
     let context = getContext();
-    let group_mode = get_settings('group_mode');
-    let group_size = get_settings('group_size');
-    let include_user_messages = get_settings('include_user_messages_in_group');
-    let lag = get_settings('summarization_delay');
-    let depth_limit = get_settings('auto_summarize_message_limit');
 
-    debug(`Collecting messages to summarize. Group Mode: ${group_mode}, Group Size: ${group_size}, Include User: ${include_user_messages}, Lag: ${lag}`);
-
-    if (!group_mode) {
-        // Use original logic for individual message summarization
-        let messages_to_summarize = [];
-        let depth = 0;
-        
-        for (let i = context.chat.length - 1; i >= 0; i--) {
-            let message = context.chat[i];
-            
-            if (!check_message_exclusion(message)) {
-                debug(`ID [${i}]: excluded`);
-                continue;
-            }
-            
-            depth++;
-            
-            if (depth <= lag) {
-                debug(`ID [${i}]: Depth <= lag (${depth} <= ${lag})`);
-                continue;
-            }
-            
-            if (depth_limit > 0 && depth > depth_limit + lag) {
-                debug(`ID [${i}]: Depth > depth limit + lag (${depth} > ${depth_limit} + ${lag})`);
-                break;
-            }
-            
-            if (get_data(message, 'memory')) {
-                debug(`ID [${i}]: Already has a memory`);
-                continue;
-            }
-            
-            messages_to_summarize.push(i);
-            debug(`ID [${i}]: Included for individual summarization`);
-        }
-        
-        return messages_to_summarize.reverse(); // chronological order
+    if (get_settings('group_mode')) {
+        return collect_message_groups_to_auto_summarize();
     }
 
-    // Group Mode: Collect assistant messages for grouping
-    let assistant_messages = [];
-    let groups_to_summarize = [];
+    let messages_to_summarize = []  // list of indexes (or arrays of indexes for mini-groups) to summarize
+    let depth_limit = get_settings('auto_summarize_message_limit')  // how many valid messages back we can go
+    let lag = get_settings('summarization_delay');  // number of messages to delay summarization for
+    let include_user_with_assistant = get_settings('include_user_with_assistant');
+    let depth = 0
+    debug(`Collecting messages to summarize. Depth limit: ${depth_limit}, Lag: ${lag}, Include user with assistant: ${include_user_with_assistant}`)
     
-    // Find all eligible assistant messages (not user messages)
-    for (let i = context.chat.length - 1; i >= 0; i--) {
+    let pending_user_messages = [];  // Track user messages to potentially include with next assistant message
+    
+    for (let i = context.chat.length-1; i >= 0; i--) {
+        // get current message
         let message = context.chat[i];
-        
-        // Only consider assistant messages for the main grouping
-        if (message.is_user || message.is_system) {
-            continue;
+
+        // For user messages when include_user_with_assistant is enabled, we have special handling
+        let include;
+        if (message.is_user && include_user_with_assistant) {
+            // Don't use the normal exclusion check for user messages when they should be included with assistants
+            // Instead, check all exclusion criteria EXCEPT the include_user_messages setting
+            include = check_message_exclusion_except_user_setting(message);
+            debug(`ID [${i}]: User message with special handling - include: ${include}`);
+        } else {
+            // Use normal exclusion check
+            include = check_message_exclusion(message);
+            if (!include && message.is_user) {
+                debug(`ID [${i}]: User message excluded by normal check (include_user_messages=${get_settings('include_user_messages')})`);
+            } else if (!include) {
+                debug(`ID [${i}]: Non-user message excluded by normal check`);
+            }
         }
         
-        if (!check_message_exclusion(message)) {
-            debug(`ID [${i}]: Assistant message excluded`);
+        if (!include) {
+            debug(`ID [${i}]: excluded`)
+            // If this user message is excluded, don't add it to pending user messages
+            if (message.is_user) {
+                pending_user_messages = [];
+            }
             continue;
         }
-        
-        if (get_data(message, 'memory')) {
-            debug(`ID [${i}]: Assistant message already has memory`);
-            continue;
+
+        depth++
+
+        // don't include if below the lag value
+        if (depth <= lag) {
+            debug(`ID [${i}]: Depth < lag (${depth} < ${lag})`)
+            // Still track user messages even if below lag threshold
+            if (message.is_user && include_user_with_assistant) {
+                pending_user_messages.unshift(i);  // Add to beginning (chronological order)
+            }
+            continue
         }
-        
-        assistant_messages.push(i);
-    }
-    
-    assistant_messages.reverse(); // chronological order
-    
-    // Apply lag and depth limits
-    // In group mode, we need to skip the most recent `lag` assistant messages
-    let eligible_assistants = [];
-    let total_assistants = assistant_messages.length;
-    
-    for (let i = 0; i < assistant_messages.length; i++) {
-        let index = assistant_messages[i];
-        let position_from_end = total_assistants - 1 - i; // 0 = most recent, 1 = second most recent, etc.
-        
-        if (position_from_end < lag) {
-            debug(`Assistant ID [${index}]: Within lag range (position ${position_from_end} < lag ${lag})`);
-            continue;
-        }
-        
-        let depth = position_from_end - lag + 1; // actual depth for limit checking
-        if (depth_limit > 0 && depth > depth_limit) {
-            debug(`Assistant ID [${index}]: Depth > depth limit (${depth} > ${depth_limit})`);
+
+        // Check depth limit (only applies if at least 1)
+        if (depth_limit > 0 && depth > depth_limit + lag) {
+            debug(`ID [${i}]: Depth > depth limit + lag (${depth} > ${depth_limit} + ${lag})`)
             break;
         }
-        
-        eligible_assistants.push(index);
-        debug(`Assistant ID [${index}]: Eligible (position ${position_from_end}, depth ${depth})`);
-    }
-    
-    // Create groups of assistant messages
-    for (let i = 0; i <= eligible_assistants.length - group_size; i += group_size) {
-        let assistant_group = eligible_assistants.slice(i, i + group_size);
-        let user_group = [];
-        
-        // If including user messages, find the corresponding user messages
-        if (include_user_messages) {
-            for (let assistant_index of assistant_group) {
-                // Look for the user message immediately before this assistant message
-                for (let j = assistant_index - 1; j >= 0; j--) {
-                    let msg = context.chat[j];
-                    if (msg.is_user) {
-                        user_group.push(j);
-                        break; // Only include the immediate previous user message
-                    }
-                }
+
+        // skip messages that already have a summary
+        if (get_data(message, 'memory')) {
+            debug(`ID [${i}]: Already has a memory`)
+            // Reset pending user messages since we hit a summarized message
+            pending_user_messages = [];
+            continue;
+        }
+
+        // skip messages that were part of a group (either as leader or member)
+        // these should not be re-summarized individually when group mode is turned off
+        let is_group_member = get_data(message, 'group_member');
+        let is_group_leader = get_data(message, 'group_leader');
+        if (is_group_member || is_group_leader) {
+            let reason = is_group_leader ? "is group leader" : "is group member";
+            debug(`ID [${i}]: Already processed as group (${reason}), skipping individual summarization`);
+            // Reset pending user messages since we hit a grouped message
+            pending_user_messages = [];
+            continue;
+        }
+
+        if (message.is_user) {
+            if (include_user_with_assistant) {
+                // Add user message to pending list to be included with next assistant message
+                pending_user_messages.unshift(i);  // Add to beginning (chronological order)
+                debug(`ID [${i}]: User message added to pending list for next assistant`);
+            } else {
+                // Summarize user message individually
+                messages_to_summarize.push(i);
+                debug(`ID [${i}]: User message included for individual summary`);
+            }
+        } else {
+            // Assistant message - include any pending user messages with it
+            if (include_user_with_assistant && pending_user_messages.length > 0) {
+                let mini_group = [...pending_user_messages, i];  // user messages first, then assistant
+                messages_to_summarize.push(mini_group);
+                debug(`ID [${i}]: Assistant message grouped with user messages: [${mini_group.join(', ')}]`);
+                debug(`User messages in group: ${pending_user_messages.map(idx => `"${context.chat[idx].mes.substring(0, 50)}..."`).join(', ')}`);
+                debug(`Assistant message in group: "${message.mes.substring(0, 50)}..."`);
+                pending_user_messages = [];  // Reset for next assistant message
+            } else {
+                // Summarize assistant message individually
+                messages_to_summarize.push(i);
+                debug(`ID [${i}]: Assistant message included for individual summary`);
             }
         }
+    }
+    debug(`Messages to summarize (${messages_to_summarize.length}): ${JSON.stringify(messages_to_summarize)}`)
+    console.log(`[${MODULE_NAME_FANCY}] FINAL COLLECTION RESULT:`, JSON.stringify(messages_to_summarize));
+    return messages_to_summarize.reverse()  // reverse for chronological order
+}
+
+function collect_message_groups_to_auto_summarize() {
+    // Collect messages in groups for group mode summarization
+    let context = getContext();
+    let group_size = get_settings('group_size');
+    let include_user_with_assistant = get_settings('include_user_with_assistant');
+    let depth_limit = get_settings('auto_summarize_message_limit');  
+    let lag = get_settings('summarization_delay');  // number of messages to delay summarization for
+    
+    let groups_to_summarize = [];  // array of arrays, each containing message indices for a group
+    let eligible_messages = [];   // messages that are eligible for summarization (beyond lag threshold)
+    let assistant_message_depth = 0;  // count of assistant messages for lag calculation (since groups are based on assistant messages)
+    let valid_messages_depth = 0; // count for depth limit
+
+    debug(`Collecting message groups. Group size: ${group_size}, Include user: ${include_user_with_assistant}, Depth limit: ${depth_limit}, Message lag: ${lag}`);
+
+    // First pass: collect all eligible messages beyond the lag threshold
+    for (let i = context.chat.length-1; i >= 0; i--) {
+        let message = context.chat[i];
+
+        debug(`ID [${i}]: Processing message - User: ${message.is_user}, Text preview: "${message.mes?.substring(0, 50)}..."`);
+
+        // Check message exclusion criteria first
+        let include;
+        if (message.is_user && include_user_with_assistant) {
+            // Don't use the normal exclusion check for user messages when they should be included with assistants
+            // Instead, check all exclusion criteria EXCEPT the include_user_messages setting
+            include = check_message_exclusion_except_user_setting(message);
+            debug(`ID [${i}]: User message with special handling in group mode - include: ${include}`);
+        } else {
+            // Use normal exclusion check
+            include = check_message_exclusion(message);
+        }
         
-        // Create range label (e.g., "2-4")
-        let range_label = assistant_group.length === 1
-            ? assistant_group[0].toString()
-            : `${assistant_group[0]}-${assistant_group[assistant_group.length - 1]}`;
+        if (!include) {
+            debug(`ID [${i}]: excluded from groups`);
+            continue;
+        }
+
+        valid_messages_depth++;
+
+        // Check depth limit for valid messages
+        if (depth_limit > 0 && valid_messages_depth > depth_limit) {
+            debug(`ID [${i}]: Beyond depth limit for valid messages (${valid_messages_depth} > ${depth_limit})`);
+            break;
+        }
+
+        // Skip messages that already have a summary OR are part of an existing group
+        let has_memory = get_data(message, 'memory');
+        let is_group_member = get_data(message, 'group_member');
+        let is_group_leader = get_data(message, 'group_leader');
         
-        groups_to_summarize.push({
-            assistant_indexes: assistant_group,
-            user_indexes: user_group,
-            range_label: range_label
-        });
+        debug(`ID [${i}]: Memory check - has_memory: ${!!has_memory}, is_group_member: ${!!is_group_member}, is_group_leader: ${!!is_group_leader}`);
+        debug(`ID [${i}]: Message extra data:`, JSON.stringify(message.extra?.[MODULE_NAME], null, 2));
         
-        debug(`Created group ${range_label}: assistants [${assistant_group.join(',')}], users [${user_group.join(',')}]`);
+        if (has_memory || is_group_member || is_group_leader) {
+            let reason = has_memory ? "has memory" : is_group_leader ? "is group leader" : "is group member";
+            debug(`ID [${i}]: Already summarized (${reason}), skipping for group.`);
+            continue;
+        }
+
+        // In group mode, only count assistant messages for lag calculation since groups are based on assistant messages
+        if (!message.is_user) {
+            assistant_message_depth++;
+        }
+
+        // Apply message lag - only include messages beyond the lag threshold (based on assistant messages)
+        if (!message.is_user && assistant_message_depth <= lag) {
+            debug(`ID [${i}]: Assistant message depth <= lag (${assistant_message_depth} <= ${lag}), skipping due to lag`);
+            continue;
+        } else if (message.is_user && include_user_with_assistant) {
+            // For user messages, check if we have enough assistant messages beyond lag to include them
+            if (assistant_message_depth <= lag) {
+                debug(`ID [${i}]: User message, but not enough assistant messages beyond lag (${assistant_message_depth} <= ${lag}), skipping`);
+                continue;
+            }
+        } else if (message.is_user && !include_user_with_assistant) {
+            // User messages not included in groups, skip
+            debug(`ID [${i}]: User message, but user messages not included in groups`);
+            continue;
+        }
+
+        // This message is eligible for summarization
+        eligible_messages.unshift(i);  // Add to beginning to maintain chronological order
+        debug(`ID [${i}]: Eligible for grouping (assistant_depth: ${assistant_message_depth}, beyond lag: ${lag})`);
+    }
+
+    // Second pass: organize eligible messages into groups
+    let current_group = [];
+    let assistant_messages_in_group = 0;
+
+    for (let i of eligible_messages) {
+        let message = context.chat[i];
+        let should_include_in_group = false;
+        
+        if (message.is_user && include_user_with_assistant) {
+            should_include_in_group = true;
+            debug(`ID [${i}]: User message included in group`);
+        } else if (!message.is_user) {
+            // This is an assistant message
+            if (assistant_messages_in_group < group_size) {
+                should_include_in_group = true;
+                assistant_messages_in_group++;
+                debug(`ID [${i}]: Assistant message ${assistant_messages_in_group}/${group_size} in group`);
+            }
+        }
+
+        if (should_include_in_group) {
+            current_group.push(i);
+        }
+
+        // Check if we've completed a group (when we have the required number of assistant messages)
+        if (assistant_messages_in_group >= group_size) {
+            debug(`Completed group: [${current_group.join(', ')}]`);
+            groups_to_summarize.push([...current_group]);
+            
+            // Reset for next group
+            current_group = [];
+            assistant_messages_in_group = 0;
+        }
+    }
+
+    debug(`Collected ${groups_to_summarize.length} groups to summarize from ${eligible_messages.length} eligible messages`);
+    
+    // Log details of each group for debugging
+    for (let i = 0; i < groups_to_summarize.length; i++) {
+        debug(`Group ${i}: [${groups_to_summarize[i].join(', ')}]`);
     }
     
-    debug(`Found ${groups_to_summarize.length} groups to summarize.`);
-    return groups_to_summarize;
+    return groups_to_summarize;  // Return array of groups (each group is an array of message indices)
 }
-async function auto_summarize_chat(skip_initial_delay = true) {
-    log('Auto-Summarizing chat...');
-    let items_to_summarize = collect_messages_to_auto_summarize();
-    let batch_size = get_settings('auto_summarize_batch_size');
-    let group_mode = get_settings('group_mode');
+async function auto_summarize_chat(skip_initial_delay=true) {
+    // Perform automatic summarization on the chat
+    log('Auto-Summarizing chat...')
+    let items_to_summarize = collect_messages_to_auto_summarize()
+    
+    debug(`Auto-summarize collected ${items_to_summarize.length} items. Group mode: ${get_settings('group_mode')}`);
 
-    if (items_to_summarize.length < batch_size) {
-        debug(`Not enough items (${items_to_summarize.length}) to meet batch size (${batch_size})`);
-        return;
-    }
-
-    let show_progress = get_settings('auto_summarize_progress');
-
-    if (group_mode) {
-        // items_to_summarize contains group data objects
-        for (const group_data of items_to_summarize) {
-            await summarize_message_group(group_data);
+    if (get_settings('group_mode')) {
+        // In group mode, items_to_summarize is an array of groups (each group is an array of message indices)
+        let groups_to_batch = get_settings('auto_summarize_batch_size');  // number of groups to summarize in a batch
+        debug(`Groups collected: ${items_to_summarize.length}, batch size: ${groups_to_batch}`);
+        
+        if (items_to_summarize.length < groups_to_batch) {
+            debug(`Not enough groups (${items_to_summarize.length}) to summarize in a batch (${groups_to_batch})`)
+            items_to_summarize = []
         }
+        
+        // Flatten groups into individual message indices for summarize_messages function
+        let messages_to_summarize = [];
+        for (let group of items_to_summarize) {
+            debug(`Processing group: [${group.join(', ')}]`);
+            messages_to_summarize.push(...group);
+        }
+        
+        debug(`Final messages to summarize: [${messages_to_summarize.join(', ')}]`);
+        let show_progress = get_settings('auto_summarize_progress');
+        await summarize_messages(messages_to_summarize, show_progress, skip_initial_delay);
     } else {
-        // items_to_summarize contains individual message indexes
+        // Traditional mode - items_to_summarize is an array of message indices
+        let messages_to_batch = get_settings('auto_summarize_batch_size');  // number of messages to summarize in a batch
+        if (items_to_summarize.length < messages_to_batch) {
+            debug(`Not enough messages (${items_to_summarize.length}) to summarize in a batch (${messages_to_batch})`)
+            items_to_summarize = []
+        }
+
+        let show_progress = get_settings('auto_summarize_progress');
         await summarize_messages(items_to_summarize, show_progress, skip_initial_delay);
     }
 }
@@ -4081,44 +4522,30 @@ async function on_chat_event(event=null, data=null) {
             if (!context.groupId && context.characterId === undefined) break; // no characters or group selected
             if (streamingProcessor && !streamingProcessor.isFinished) break;  // Streaming in-progress
 
+            debug(`char_message event: index=${index}, last_message_swiped=${last_message_swiped}, last_message=${last_message}`);
+
             let skip_first_delay = get_settings('summarization_time_delay_skip_first')
             if (last_message_swiped === index) {  // this is a swipe
                 let message = context.chat[index];
                 if (!get_settings('auto_summarize_on_swipe')) break;  // if auto-summarize on swipe is disabled, do nothing
                 if (!check_message_exclusion(message)) break;  // if the message is excluded, skip
                 if (!get_previous_swipe_memory(message, 'memory')) break;  // if the previous swipe doesn't have a memory, skip
-                debug("re-summarizing on swipe")
-                
-                // Check if group mode is enabled
-                if (get_settings('group_mode')) {
-                    // In group mode, trigger auto-summarize which will handle grouping
-                    await auto_summarize_chat(skip_first_delay);
-                } else {
-                    // Individual mode, summarize just this message
-                    await summarize_messages(index, true, skip_first_delay);
-                }
+                debug("re-summarizing on swipe - BYPASSING GROUP MODE")
+                await summarize_messages(index, true, skip_first_delay);  // summarize the swiped message
                 refresh_memory()
             } else if (last_message === index) {  // not a swipe, but the same index as last message - must be a continue
                 last_message_swiped = null
                 let message = context.chat[index];
                 if (!get_settings("auto_summarize_on_continue")) break;  // if auto_summarize_on_continue is disabled, no nothing
                 if (!get_memory(message, 'memory')) break;  // if the message doesn't have a memory, skip.
-                debug("re-summarizing on continue")
-                
-                // Check if group mode is enabled
-                if (get_settings('group_mode')) {
-                    // In group mode, trigger auto-summarize which will handle grouping
-                    await auto_summarize_chat(skip_first_delay);
-                } else {
-                    // Individual mode, summarize just this message
-                    await summarize_messages(index, true, skip_first_delay);
-                }
+                debug("re-summarizing on continue - BYPASSING GROUP MODE")
+                await summarize_messages(index, true, skip_first_delay);  // summarize the swiped message
                 refresh_memory()
             } else { // not a swipe or continue
                 last_message_swiped = null
                 if (!get_settings('auto_summarize')) break;  // if auto-summarize is disabled, do nothing
                 if (get_settings("auto_summarize_on_send")) break;  // if auto_summarize_on_send is enabled, don't auto-summarize on character message
-                debug("New message detected, summarizing")
+                debug("New message detected, using group-aware auto-summarization")
                 await auto_summarize_chat(skip_first_delay);  // auto-summarize the chat, skipping first delay if needed
             }
             last_message = index;
@@ -4131,15 +4558,7 @@ async function on_chat_event(event=null, data=null) {
             if (!check_message_exclusion(context.chat[index])) break;  // if the message is excluded, skip
             if (!get_data(context.chat[index], 'memory')) break;  // if the message doesn't have a memory, skip
             debug("Message with memory edited, summarizing")
-            
-            // Check if group mode is enabled
-            if (get_settings('group_mode')) {
-                // In group mode, trigger auto-summarize which will handle grouping
-                auto_summarize_chat();  // no await so the message edit goes through
-            } else {
-                // Individual mode, summarize just this message
-                summarize_messages(index);  // summarize that message (no await so the message edit goes through)
-            }
+            summarize_messages(index);  // summarize that message (no await so the message edit goes through)
 
             // TODO: I'd like to be able to refresh the memory here, but we can't await the summarization because
             //  then the message edit textbox doesn't close until the summary is done.
@@ -4228,9 +4647,6 @@ function initialize_settings_listeners() {
     bind_setting('#auto_summarize_on_edit', 'auto_summarize_on_edit', 'boolean');
     bind_setting('#auto_summarize_on_swipe', 'auto_summarize_on_swipe', 'boolean');
     bind_setting('#auto_summarize_on_continue', 'auto_summarize_on_continue', 'boolean');
-    bind_setting('#group_mode', 'group_mode', 'boolean');
-    bind_setting('#group_size', 'group_size', 'number');
-    bind_setting('#include_user_messages_in_group', 'include_user_messages_in_group', 'boolean');
     bind_setting('#auto_summarize_batch_size', 'auto_summarize_batch_size', 'number');
     bind_setting('#auto_summarize_message_limit', 'auto_summarize_message_limit', 'number');
     bind_setting('#auto_summarize_progress', 'auto_summarize_progress', 'boolean');
@@ -4238,6 +4654,9 @@ function initialize_settings_listeners() {
     bind_setting('#summarization_delay', 'summarization_delay', 'number');
     bind_setting('#summarization_time_delay', 'summarization_time_delay', 'number')
     bind_setting('#summarization_time_delay_skip_first', 'summarization_time_delay_skip_first', 'boolean')
+    bind_setting('#group_mode', 'group_mode', 'boolean', () => refresh_settings());
+    bind_setting('#group_size', 'group_size', 'number');
+    bind_setting('#include_user_with_assistant', 'include_user_with_assistant', 'boolean');
 
     bind_setting('#include_user_messages', 'include_user_messages', 'boolean');
     bind_setting('#include_system_messages', 'include_system_messages', 'boolean');
@@ -4627,7 +5046,8 @@ function initialize_slash_commands() {
         aliases: ['qvink-memory-summarize-chat'],
         helpString: 'Summarize the chat using the auto-summarization criteria, even if auto-summarization is off.',
         callback: async (args, limit) => {
-            await auto_summarize_chat();  // use auto_summarize_chat which handles both group and individual modes
+            let indexes = collect_messages_to_auto_summarize();
+            await summarize_messages(indexes);
             return ""
         },
     }));
